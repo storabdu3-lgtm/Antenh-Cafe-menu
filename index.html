@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      (function() {
+        try {
+          var g = typeof window !== 'undefined' ? window : typeof globalThis !== 'undefined' ? globalThis : self;
+          if (!g) return;
+          var activeFetch = g.fetch ? g.fetch.bind(g) : null;
+          function installSafeFetch(target) {
+            if (!target) return;
+            try {
+              var desc = Object.getOwnPropertyDescriptor(target, 'fetch');
+              if (!desc || !desc.set || desc.writable === false) {
+                Object.defineProperty(target, 'fetch', {
+                  get: function() {
+                    return activeFetch;
+                  },
+                  set: function(newFetch) {
+                    activeFetch = newFetch;
+                  },
+                  configurable: true,
+                  enumerable: true
+                });
+              }
+            } catch (_) {}
+          }
+          if (typeof window !== 'undefined') {
+            installSafeFetch(window);
+            if (typeof Window !== 'undefined' && Window.prototype) {
+              installSafeFetch(Window.prototype);
+            }
+          }
+          if (typeof globalThis !== 'undefined') {
+            installSafeFetch(globalThis);
+          }
+        } catch (e) {
+          console.warn('Safe fetch init error:', e);
+        }
+      })();
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cafe Lina - Luxury Coffee &amp; ERP System</title>
+    <meta name="description" content="Full-stack luxury coffee shop website, online ordering, customer portal, admin dashboard, and ERP system for Cafe Lina." />
+    <meta property="og:title" content="Cafe Lina - Luxury Coffee &amp; ERP System" />
+    <meta property="og:description" content="Full-stack luxury coffee shop website, online ordering, customer portal, admin dashboard, and ERP system for Cafe Lina." />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/main.tsx"></script>
+  </body>
+</html>
+

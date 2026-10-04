@@ -1,0 +1,8 @@
+{
+  "name": "Remix cafe-lina-Anteneh",
+  "description": "Imported from GitHub: ea0396481-ui/cafe-lina-Anteneh",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

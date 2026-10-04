@@ -1,5 +1,6 @@
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 import {
   collection,
@@ -22,6 +23,16 @@ import {
   INITIAL_PURCHASE_ORDERS,
   INITIAL_RECIPE_COSTS,
   INITIAL_EPR_RECORDS,
+  INITIAL_CATEGORIES,
+  INITIAL_STORES,
+  INITIAL_STOCK_IN_VOUCHERS,
+  INITIAL_STORE_REQUESTS,
+  INITIAL_STORE_TRANSFERS,
+  INITIAL_POS_RECEIPTS,
+  INITIAL_BIN_CARDS,
+  INITIAL_DAMAGE_VOUCHERS,
+  INITIAL_STAFF_MEALS,
+  INITIAL_SYSTEM_USERS,
 } from './data/mockData.ts';
 import { Order, MenuItem, Reservation, InventoryItem, Supplier, PurchaseOrder, Employee } from './types.ts';
 
@@ -30,6 +41,77 @@ async function startServer() {
   const PORT = 3000;
 
   app.use(express.json({ limit: '10mb' }));
+
+  // ===================== PERSISTENT CLOUD DATABASE LAYER ===================== //
+  const DB_FILE = path.resolve(process.cwd(), 'data', 'cloud_store.json');
+
+  function getDefaultStore(): Record<string, any[]> {
+    return {
+      menuItems: [...INITIAL_MENU_ITEMS],
+      orders: [...INITIAL_ORDERS],
+      reservations: [...INITIAL_RESERVATIONS],
+      inventory: [...INITIAL_INVENTORY],
+      suppliers: [...INITIAL_SUPPLIERS],
+      purchaseOrders: [...INITIAL_PURCHASE_ORDERS],
+      employees: [...INITIAL_EMPLOYEES],
+      recipeCosts: [...INITIAL_RECIPE_COSTS],
+      eprRecords: [...INITIAL_EPR_RECORDS],
+      customers: [...INITIAL_CUSTOMERS],
+      categories: [...INITIAL_CATEGORIES],
+      stores: [...INITIAL_STORES],
+      stockInVouchers: [...INITIAL_STOCK_IN_VOUCHERS],
+      storeRequests: [...INITIAL_STORE_REQUESTS],
+      storeTransfers: [...INITIAL_STORE_TRANSFERS],
+      posReceipts: [...INITIAL_POS_RECEIPTS],
+      binCards: [...INITIAL_BIN_CARDS],
+      damageVouchers: [...INITIAL_DAMAGE_VOUCHERS],
+      staffMeals: [...INITIAL_STAFF_MEALS],
+      systemUsers: [...INITIAL_SYSTEM_USERS],
+    };
+  }
+
+  function loadCloudStore(): Record<string, any[]> {
+    try {
+      if (fs.existsSync(DB_FILE)) {
+        const raw = fs.readFileSync(DB_FILE, 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          return { ...getDefaultStore(), ...parsed };
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to load cloud_store.json, creating initial store:', e);
+    }
+    const def = getDefaultStore();
+    try {
+      fs.writeFileSync(DB_FILE, JSON.stringify(def, null, 2), 'utf-8');
+    } catch (_) {}
+    return def;
+  }
+
+  let cloudStore = loadCloudStore();
+
+  function saveCloudStore() {
+    try {
+      fs.writeFileSync(DB_FILE, JSON.stringify(cloudStore, null, 2), 'utf-8');
+    } catch (e) {
+      console.warn('Failed to persist cloud_store.json:', e);
+    }
+  }
+
+  // Active Server-Sent Events (SSE) clients for real-time multi-device sync
+  const sseClients = new Set<express.Response>();
+
+  function broadcastSSE(payload: any) {
+    const data = `data: ${JSON.stringify(payload)}\n\n`;
+    for (const client of sseClients) {
+      try {
+        client.write(data);
+      } catch (_) {
+        sseClients.delete(client);
+      }
+    }
+  }
 
   // In-memory data state with Firestore two-way bridge
   let menuItems: MenuItem[] = [...INITIAL_MENU_ITEMS];
@@ -44,6 +126,103 @@ async function startServer() {
   let customers = [...INITIAL_CUSTOMERS];
 
   // ===================== REST API ENDPOINTS ===================== //
+
+  // SSE Real-time Multi-Device Sync Stream
+  app.get('/api/cloud-db/events', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    sseClients.add(res);
+
+    // Initial handshake
+    res.write(`data: ${JSON.stringify({ type: 'CONNECTED', timestamp: Date.now() })}\n\n`);
+
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(`: heartbeat\n\n`);
+      } catch (_) {
+        clearInterval(heartbeat);
+        sseClients.delete(res);
+      }
+    }, 15000);
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      sseClients.delete(res);
+    });
+  });
+
+  // Get collection items (Cross-device fetch)
+  app.get('/api/cloud-db/:collection', (req, res) => {
+    const { collection } = req.params;
+    const items = cloudStore[collection] || [];
+    res.json(items);
+  });
+
+  // Save/Update item in collection (Cross-device save)
+  app.post('/api/cloud-db/:collection', (req, res) => {
+    const { collection } = req.params;
+    const item = req.body;
+    if (!cloudStore[collection]) {
+      cloudStore[collection] = [];
+    }
+
+    const idField =
+      item.voucherId !== undefined
+        ? 'voucherId'
+        : item.id !== undefined
+        ? 'id'
+        : 'id';
+    const itemId = String(item[idField] || Date.now());
+    const enrichedItem = { ...item, [idField]: itemId, _updatedAt: new Date().toISOString() };
+
+    const idx = cloudStore[collection].findIndex(
+      (existing: any) => String(existing[idField] || existing.id || existing.voucherId) === itemId
+    );
+
+    if (idx >= 0) {
+      cloudStore[collection][idx] = enrichedItem;
+    } else {
+      cloudStore[collection].unshift(enrichedItem);
+    }
+
+    saveCloudStore();
+    broadcastSSE({ collection, action: 'SAVE', data: enrichedItem });
+    res.json({ success: true, item: enrichedItem });
+  });
+
+  // Delete item from collection
+  app.delete('/api/cloud-db/:collection/:id', (req, res) => {
+    const { collection, id } = req.params;
+    if (cloudStore[collection]) {
+      cloudStore[collection] = cloudStore[collection].filter(
+        (existing: any) => String(existing.id || existing.voucherId) !== id
+      );
+      saveCloudStore();
+      broadcastSSE({ collection, action: 'DELETE', id });
+    }
+    res.json({ success: true, id });
+  });
+
+  // Clear all sample data across all collections
+  app.post('/api/cloud-db/clear-all', (_req, res) => {
+    for (const key of Object.keys(cloudStore)) {
+      cloudStore[key] = [];
+    }
+    saveCloudStore();
+    broadcastSSE({ action: 'SET_ALL_EMPTY' });
+    res.json({ success: true, message: 'All collections cleared' });
+  });
+
+  // Reset to factory sample data
+  app.post('/api/cloud-db/reset-sample', (_req, res) => {
+    cloudStore = getDefaultStore();
+    saveCloudStore();
+    broadcastSSE({ action: 'RESET_SAMPLE', data: cloudStore });
+    res.json({ success: true, message: 'Reset to default sample data' });
+  });
 
   // Health check
   app.get('/api/health', (_req, res) => {

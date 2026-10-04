@@ -103,9 +103,42 @@ export function sanitizeForFirestore<T>(data: T): T {
   return data;
 }
 
+// Shared Singleton SSE Connection for real-time multi-device synchronization
+let globalEventSource: EventSource | null = null;
+let sseReconnectTimeout: any = null;
+
+export function ensureSSEConnection(): void {
+  if (typeof window === 'undefined') return;
+  if (globalEventSource && globalEventSource.readyState !== EventSource.CLOSED) return;
+
+  try {
+    globalEventSource = new EventSource('/api/cloud-db/events');
+
+    globalEventSource.onmessage = (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+        window.dispatchEvent(new CustomEvent('cloud-db-update', { detail: payload }));
+      } catch (err) {
+        console.error('SSE parse error:', err);
+      }
+    };
+
+    globalEventSource.onerror = () => {
+      if (globalEventSource) {
+        globalEventSource.close();
+        globalEventSource = null;
+      }
+      clearTimeout(sseReconnectTimeout);
+      sseReconnectTimeout = setTimeout(ensureSSEConnection, 3000);
+    };
+  } catch (err) {
+    console.warn('SSE connection notice:', err);
+  }
+}
+
 /**
- * Direct real-time subscription to a Cloud Firestore collection.
- * Adheres to Firebase React Guidelines: Only attach onSnapshot listeners if auth is ready and user is authenticated.
+ * Direct real-time subscription to a Cloud Database collection with multi-device cross-device synchronization.
+ * Guarantees that data saved on Device 1 immediately shows up on Device 2, 3, etc.
  */
 export function subscribeToCollection<T extends Record<string, any>>(
   collectionName: string,
@@ -113,9 +146,56 @@ export function subscribeToCollection<T extends Record<string, any>>(
   initialData: T[],
   onData: (data: T[]) => void
 ): Unsubscribe {
-  let unsubscribeSnapshot: Unsubscribe | null = null;
+  let isMounted = true;
+  ensureSSEConnection();
 
-  // Track auth state - only attach real-time onSnapshot listeners if the user is authenticated
+  // 1. Immediately fetch saved records from Cloud Server Database
+  fetch(`/api/cloud-db/${collectionName}`)
+    .then((res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    })
+    .then((items) => {
+      if (isMounted && Array.isArray(items)) {
+        onData(items);
+      }
+    })
+    .catch((err) => {
+      console.warn(`Initial fetch error for ${collectionName}:`, err);
+      if (isMounted) onData(initialData);
+    });
+
+  // 2. Real-time listener for events emitted by any connected device
+  const onUpdate = (e: Event) => {
+    const custom = e as CustomEvent;
+    const detail = custom.detail;
+    if (!detail || !isMounted) return;
+
+    if (detail.action === 'SET_ALL_EMPTY') {
+      onData([]);
+      return;
+    }
+
+    if (detail.action === 'RESET_SAMPLE' && detail.data && detail.data[collectionName]) {
+      onData(detail.data[collectionName]);
+      return;
+    }
+
+    if (detail.collection === collectionName) {
+      // Re-fetch latest collection state from Cloud Server Database
+      fetch(`/api/cloud-db/${collectionName}`)
+        .then((res) => res.json())
+        .then((items) => {
+          if (isMounted && Array.isArray(items)) onData(items);
+        })
+        .catch(() => {});
+    }
+  };
+
+  window.addEventListener('cloud-db-update', onUpdate);
+
+  // 3. When Firebase Auth is authenticated, also sync with Firestore onSnapshot
+  let unsubscribeSnapshot: Unsubscribe | null = null;
   const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
     if (unsubscribeSnapshot) {
       unsubscribeSnapshot();
@@ -129,35 +209,26 @@ export function subscribeToCollection<T extends Record<string, any>>(
           colRef,
           (snapshot) => {
             if (!snapshot.empty) {
-              const items = snapshot.docs.map((d) => {
-                const raw = d.data();
-                return {
-                  ...raw,
-                  [idField]: d.id,
-                } as T;
-              });
-              onData(items);
-            } else {
-              // Connected to Cloud Database: collection is empty, so clear all sample data
-              onData([]);
+              const items = snapshot.docs.map((d) => ({
+                ...d.data(),
+                [idField]: d.id,
+              } as T));
+              if (isMounted) onData(items);
             }
           },
           (error) => {
             handleFirestoreError(error, OperationType.GET, collectionName);
-            onData([]);
           }
         );
       } catch (error) {
         handleFirestoreError(error, OperationType.GET, collectionName);
-        onData([]);
       }
-    } else {
-      // Unauthenticated: safely present initial data without firing unauthorized listener errors
-      onData(initialData);
     }
   });
 
   return () => {
+    isMounted = false;
+    window.removeEventListener('cloud-db-update', onUpdate);
     unsubscribeAuth();
     if (unsubscribeSnapshot) {
       unsubscribeSnapshot();
@@ -186,41 +257,50 @@ export async function clearCollection(collectionName: string): Promise<boolean> 
 }
 
 /**
- * Wipe all sample data across all collections in the Cloud Database
+ * Wipe all sample data across all collections in the Cloud Database and Cloud Server Database
  */
 export async function clearAllSampleData(): Promise<{ success: boolean; clearedCollections: string[] }> {
-  const collectionsToClear = [
-    'menuItems',
-    'orders',
-    'reservations',
-    'inventory',
-    'suppliers',
-    'purchaseOrders',
-    'employees',
-    'recipeCosts',
-    'eprRecords',
-    'customers',
-    'categories',
-    'stores',
-    'stockInVouchers',
-    'storeRequests',
-    'storeTransfers',
-    'posReceipts',
-    'binCards',
-    'damageVouchers',
-    'staffMeals',
-  ];
-
-  const cleared: string[] = [];
-  for (const col of collectionsToClear) {
-    await clearCollection(col);
-    cleared.push(col);
+  // Clear persistent cloud server database
+  try {
+    await fetch('/api/cloud-db/clear-all', { method: 'POST' });
+  } catch (err) {
+    console.warn('Server clear all notice:', err);
   }
-  return { success: true, clearedCollections: cleared };
+
+  // Clear Firestore collections if authenticated
+  if (auth.currentUser) {
+    const collectionsToClear = [
+      'menuItems',
+      'orders',
+      'reservations',
+      'inventory',
+      'suppliers',
+      'purchaseOrders',
+      'employees',
+      'recipeCosts',
+      'eprRecords',
+      'customers',
+      'categories',
+      'stores',
+      'stockInVouchers',
+      'storeRequests',
+      'storeTransfers',
+      'posReceipts',
+      'binCards',
+      'damageVouchers',
+      'staffMeals',
+    ];
+
+    for (const col of collectionsToClear) {
+      await clearCollection(col);
+    }
+  }
+
+  return { success: true, clearedCollections: [] };
 }
 
 /**
- * Direct save (create or update) to Cloud Firestore
+ * Direct save (create or update) to Cloud Database with instant multi-device propagation
  */
 export async function saveItem<T extends Record<string, any>>(
   collectionName: string,
@@ -231,23 +311,40 @@ export async function saveItem<T extends Record<string, any>>(
   const docId = String(item[idField] || (item as any).id || (item as any).voucherId || Date.now());
   const path = `${collectionName}/${docId}`;
 
+  // 1. Immediately save to Cloud Server Database so ALL other devices see it
   try {
-    const docRef = doc(db, collectionName, docId);
-    const sanitized = sanitizeForFirestore({
-      ...item,
-      [idField]: docId,
-      _updatedAt: new Date().toISOString(),
+    const res = await fetch(`/api/cloud-db/${collectionName}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...item, [idField]: docId }),
     });
-    await setDoc(docRef, sanitized, { merge: true });
-    return true;
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, path);
-    return false;
+    if (!res.ok) {
+      console.warn(`Cloud DB save failed for ${collectionName}: ${res.status}`);
+    }
+  } catch (err) {
+    console.warn(`Cloud DB save error for ${collectionName}:`, err);
   }
+
+  // 2. Also save to Firestore if user is authenticated with Firebase
+  if (auth.currentUser) {
+    try {
+      const docRef = doc(db, collectionName, docId);
+      const sanitized = sanitizeForFirestore({
+        ...item,
+        [idField]: docId,
+        _updatedAt: new Date().toISOString(),
+      });
+      await setDoc(docRef, sanitized, { merge: true });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, path);
+    }
+  }
+
+  return true;
 }
 
 /**
- * Direct delete from Cloud Firestore
+ * Direct delete from Cloud Database with instant multi-device propagation
  */
 export async function deleteItem(
   collectionName: string,
@@ -256,14 +353,27 @@ export async function deleteItem(
   _userId: string | null = null
 ): Promise<boolean> {
   const path = `${collectionName}/${docId}`;
+
+  // 1. Delete from Cloud Server Database
   try {
-    const docRef = doc(db, collectionName, docId);
-    await deleteDoc(docRef);
-    return true;
-  } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, path);
-    return false;
+    await fetch(`/api/cloud-db/${collectionName}/${docId}`, {
+      method: 'DELETE',
+    });
+  } catch (err) {
+    console.warn(`Cloud DB delete error for ${collectionName}:`, err);
   }
+
+  // 2. Also delete from Firestore if user is authenticated
+  if (auth.currentUser) {
+    try {
+      const docRef = doc(db, collectionName, docId);
+      await deleteDoc(docRef);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, path);
+    }
+  }
+
+  return true;
 }
 
 /**

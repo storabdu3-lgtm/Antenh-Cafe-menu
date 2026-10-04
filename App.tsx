@@ -196,35 +196,7 @@ export default function App() {
   const [staffMeals, setStaffMeals] = useState<StaffMealRecord[]>(INITIAL_STAFF_MEALS);
   const [systemUsers, setSystemUsers] = useState<SystemUser[]>(INITIAL_SYSTEM_USERS);
 
-  // Real-time Firebase Sync Effect across all devices
-  // When connected to Cloud Database, wipe out demo/sample data so only real Cloud Firestore data appears
-  useEffect(() => {
-    const unsubAuth = onAuthStateChanged(auth, (user) => {
-      if (user) {
-        setMenuItems([]);
-        setOrders([]);
-        setReservations([]);
-        setInventory([]);
-        setSuppliers([]);
-        setPurchaseOrders([]);
-        setEmployees([]);
-        setRecipeCosts([]);
-        setEprRecords([]);
-        setCustomers([]);
-        setCategories([]);
-        setStores([]);
-        setStockInVouchers([]);
-        setStoreRequests([]);
-        setStoreTransfers([]);
-        setPosReceipts([]);
-        setBinCards([]);
-        setDamageVouchers([]);
-        setStaffMeals([]);
-      }
-    });
-    return () => unsubAuth();
-  }, []);
-
+  // Real-time Cloud Database & Multi-Device Sync Effect
   const handleClearAllSampleData = async () => {
     setMenuItems([]);
     setOrders([]);
